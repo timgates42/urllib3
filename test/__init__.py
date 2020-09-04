@@ -17,10 +17,17 @@ except ImportError:
 from urllib3.exceptions import HTTPWarning
 from urllib3.packages import six
 from urllib3.util import ssl_
+from urllib3 import util
 
 # We need a host that will not immediately close the connection with a TCP
-# Reset. SO suggests this hostname
-TARPIT_HOST = "10.255.255.1"
+# Reset.
+if platform.system() == "Windows":
+    # Reserved loopback subnet address
+    TARPIT_HOST = "127.0.0.0"
+else:
+    # Reserved internet scoped address
+    # https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
+    TARPIT_HOST = "240.0.0.0"
 
 # (Arguments for socket, is it IPv6 address?)
 VALID_SOURCE_ADDRESSES = [(("::1", 0), True), (("127.0.0.1", 0), False)]
@@ -48,6 +55,19 @@ def _can_resolve(host):
         return True
     except socket.gaierror:
         return False
+
+
+def has_alpn(ctx_cls=None):
+    """ Detect if ALPN support is enabled. """
+    ctx_cls = ctx_cls or util.SSLContext
+    ctx = ctx_cls(protocol=ssl_.PROTOCOL_TLS)
+    try:
+        if hasattr(ctx, "set_alpn_protocols"):
+            ctx.set_alpn_protocols(ssl_.ALPN_PROTOCOLS)
+            return True
+    except NotImplementedError:
+        pass
+    return False
 
 
 # Some systems might not resolve "localhost." correctly.

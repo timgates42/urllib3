@@ -102,7 +102,7 @@ class TimeoutStateError(HTTPError):
 
 
 class TimeoutError(HTTPError):
-    """ Raised when a socket timeout error occurs.
+    """Raised when a socket timeout error occurs.
 
     Catching this error will catch both :exc:`ReadTimeoutErrors
     <ReadTimeoutError>` and :exc:`ConnectTimeoutErrors <ConnectTimeoutError>`.
@@ -151,6 +151,16 @@ class LocationParseError(LocationValueError):
         HTTPError.__init__(self, message)
 
         self.location = location
+
+
+class URLSchemeUnknown(LocationValueError):
+    "Raised when a URL input has an unsupported scheme."
+
+    def __init__(self, scheme):
+        message = "Not supported URL scheme %s" % scheme
+        super(URLSchemeUnknown, self).__init__(message)
+
+        self.scheme = scheme
 
 
 class ResponseError(HTTPError):
@@ -231,12 +241,29 @@ class IncompleteRead(HTTPError, httplib_IncompleteRead):
         )
 
 
+class InvalidChunkLength(HTTPError, httplib_IncompleteRead):
+    """Invalid chunk length in a chunked response."""
+
+    def __init__(self, response, length):
+        super(InvalidChunkLength, self).__init__(
+            response.tell(), response.length_remaining
+        )
+        self.response = response
+        self.length = length
+
+    def __repr__(self):
+        return "InvalidChunkLength(got length %r, %i bytes read)" % (
+            self.length,
+            self.partial,
+        )
+
+
 class InvalidHeader(HTTPError):
     "The header provided was somehow invalid."
     pass
 
 
-class ProxySchemeUnknown(AssertionError, ValueError):
+class ProxySchemeUnknown(AssertionError, URLSchemeUnknown):
     "ProxyManager does not support the supplied scheme"
     # TODO(t-8ch): Stop inheriting from AssertionError in v2.0.
 

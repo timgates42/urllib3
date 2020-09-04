@@ -19,11 +19,12 @@ from .exceptions import (
     ReadTimeoutError,
     ResponseNotChunked,
     IncompleteRead,
+    InvalidChunkLength,
     InvalidHeader,
     HTTPError,
+    SSLError,
 )
 from .packages.six import string_types as basestring, PY3
-from .packages.six.moves import http_client as httplib
 from .connection import HTTPException, BaseSSLError
 from .util.response import is_fp_closed, is_response_to_head
 
@@ -442,10 +443,9 @@ class HTTPResponse(io.IOBase):
 
             except BaseSSLError as e:
                 # FIXME: Is there a better way to differentiate between SSLErrors?
-                if "read operation timed out" not in str(e):  # Defensive:
-                    # This shouldn't happen but just in case we're missing an edge
-                    # case, let's avoid swallowing SSL errors.
-                    raise
+                if "read operation timed out" not in str(e):
+                    # SSL errors related to framing/MAC get wrapped and reraised here
+                    raise SSLError(e)
 
                 raise ReadTimeoutError(self._pool, None, "Read timed out.")
 
@@ -697,7 +697,7 @@ class HTTPResponse(io.IOBase):
         except ValueError:
             # Invalid chunked protocol response, abort.
             self.close()
-            raise httplib.IncompleteRead(line)
+            raise InvalidChunkLength(self, line)
 
     def _handle_chunk(self, amt):
         returned_chunk = None

@@ -49,6 +49,7 @@ from urllib3.exceptions import (
 from urllib3.packages import six
 from urllib3.util.timeout import Timeout
 import urllib3.util as util
+from .. import has_alpn
 
 # Retry failed tests
 pytestmark = pytest.mark.flaky
@@ -697,6 +698,35 @@ class TestHTTPS(HTTPSDummyServerTestCase):
                 assert conn.sock.version() == self.tls_protocol_name
             finally:
                 conn.close()
+
+    @pytest.mark.skipif(sys.version_info < (3, 8), reason="requires python 3.8+")
+    def test_sslkeylogfile(self, tmpdir, monkeypatch):
+        if not hasattr(util.SSLContext, "keylog_filename"):
+            pytest.skip("requires OpenSSL 1.1.1+")
+        keylog_file = tmpdir.join("keylogfile.txt")
+        monkeypatch.setenv("SSLKEYLOGFILE", str(keylog_file))
+        with HTTPSConnectionPool(
+            self.host, self.port, ca_certs=DEFAULT_CA
+        ) as https_pool:
+            r = https_pool.request("GET", "/")
+            assert r.status == 200, r.data
+            assert keylog_file.check(file=1), "keylogfile '%s' should exist" % str(
+                keylog_file
+            )
+            assert keylog_file.read().startswith(
+                "# TLS secrets log file"
+            ), "keylogfile '%s' should start with '# TLS secrets log file'" % str(
+                keylog_file
+            )
+
+    def test_alpn_default(self):
+        """Default ALPN protocols are sent by default."""
+        if not has_alpn() or not has_alpn(ssl.SSLContext):
+            pytest.skip("ALPN-support not available")
+        with HTTPSConnectionPool(self.host, self.port, ca_certs=DEFAULT_CA) as pool:
+            r = pool.request("GET", "/alpn_protocol", retries=0)
+            assert r.status == 200
+            assert r.data.decode("utf-8") == util.ALPN_PROTOCOLS[0]
 
 
 @requiresTLSv1()

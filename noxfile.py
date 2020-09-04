@@ -5,6 +5,20 @@ import subprocess
 import nox
 
 
+# Whenever type-hints are completed on a file it should be added here so that
+# this file will continue to be checked by mypy. Errors from other files are
+# ignored.
+TYPED_FILES = {
+    "src/urllib3/exceptions.py",
+    "src/urllib3/fields.py",
+    "src/urllib3/packages/__init__.py",
+    "src/urllib3/packages/six.py",
+    "src/urllib3/packages/ssl_match_hostname/__init__.py",
+    "src/urllib3/packages/ssl_match_hostname/_implementation.py",
+    "src/urllib3/util/queue.py",
+}
+
+
 def tests_impl(session, extras="socks,secure,brotli"):
     # Install deps and the package itself.
     session.install("-r", "dev-requirements.txt")
@@ -34,14 +48,14 @@ def tests_impl(session, extras="socks,secure,brotli"):
         "--tb=native",
         "--no-success-flaky-report",
         *(session.posargs or ("test/",)),
-        env={"PYTHONWARNINGS": "always::DeprecationWarning"}
+        env={"PYTHONWARNINGS": "always::DeprecationWarning"},
     )
     session.run("coverage", "combine")
     session.run("coverage", "report", "-m")
     session.run("coverage", "xml")
 
 
-@nox.session(python=["2.7", "3.5", "3.6", "3.7", "3.8", "3.9", "pypy"])
+@nox.session(python=["2.7", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "pypy"])
 def test(session):
     tests_impl(session)
 
@@ -68,7 +82,7 @@ def app_engine(session):
         "-r",
         "sx",
         "test/appengine",
-        *session.posargs
+        *session.posargs,
     )
     session.run("coverage", "combine")
     session.run("coverage", "report", "-m")
@@ -86,15 +100,37 @@ def blacken(session):
 
 @nox.session
 def lint(session):
-    session.install("flake8", "black", "spelling")
+    session.install("flake8", "black", "mypy", "spellin")
     session.run("flake8", "--version")
     session.run("black", "--version")
+    session.run("mypy", "--version")
     session.run("python", "-m", "spelling", "--version")
     session.run(
         "black", "--check", "src", "dummyserver", "test", "noxfile.py", "setup.py"
     )
     session.run("flake8", "setup.py", "docs", "dummyserver", "src", "test")
     session.run("spelling")
+
+    session.log("mypy --strict src/urllib3")
+    all_errors, errors = [], []
+    process = subprocess.run(
+        ["mypy", "--strict", "src/urllib3"],
+        env=session.env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    # Ensure that mypy itself ran succesfully
+    assert process.returncode in (0, 1)
+
+    for line in process.stdout.split("\n"):
+        all_errors.append(line)
+        filepath = line.partition(":")[0]
+        if filepath.replace(".pyi", ".py") in TYPED_FILES:
+            errors.append(line)
+    session.log("all errors count: {}".format(len(all_errors)))
+    if errors:
+        session.error("\n" + "\n".join(sorted(set(errors))))
 
 
 @nox.session

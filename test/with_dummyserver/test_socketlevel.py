@@ -2,6 +2,7 @@
 # rather than the socket level-ness of it.
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.poolmanager import proxy_from_url
+from urllib3.connection import _get_default_user_agent
 from urllib3.exceptions import (
     MaxRetryError,
     ProxyError,
@@ -9,9 +10,9 @@ from urllib3.exceptions import (
     SSLError,
     ProtocolError,
 )
-from urllib3.response import httplib
+from urllib3.packages.six.moves import http_client as httplib
+from urllib3 import util
 from urllib3.util import ssl_wrap_socket
-from urllib3.util.ssl_ import HAS_SNI
 from urllib3.util import ssl_
 from urllib3.util.timeout import Timeout
 from urllib3.util.retry import Retry
@@ -25,7 +26,7 @@ from dummyserver.server import (
     encrypt_key_pem,
 )
 
-from .. import onlyPy3, LogRecorder
+from .. import onlyPy3, LogRecorder, has_alpn
 
 try:
     from mimetools import Message as MimeToolMessage
@@ -87,8 +88,9 @@ class TestCookies(SocketDummyServerTestCase):
 
 
 class TestSNI(SocketDummyServerTestCase):
-    @pytest.mark.skipif(not HAS_SNI, reason="SNI-support not available")
     def test_hostname_in_first_request_packet(self):
+        if not util.HAS_SNI:
+            pytest.skip("SNI-support not available")
         done_receiving = Event()
         self.buf = b""
 
@@ -100,7 +102,7 @@ class TestSNI(SocketDummyServerTestCase):
             sock.close()
 
         self._start_server(socket_handler)
-        with HTTPConnectionPool(self.host, self.port) as pool:
+        with HTTPSConnectionPool(self.host, self.port) as pool:
             try:
                 pool.request("GET", "/", retries=0)
             except MaxRetryError:  # We are violating the protocol
@@ -110,6 +112,35 @@ class TestSNI(SocketDummyServerTestCase):
             assert (
                 self.host.encode("ascii") in self.buf
             ), "missing hostname in SSL handshake"
+
+
+class TestALPN(SocketDummyServerTestCase):
+    def test_alpn_protocol_in_first_request_packet(self):
+        if not has_alpn():
+            pytest.skip("ALPN-support not available")
+
+        done_receiving = Event()
+        self.buf = b""
+
+        def socket_handler(listener):
+            sock = listener.accept()[0]
+
+            self.buf = sock.recv(65536)  # We only accept one packet
+            done_receiving.set()  # let the test know it can proceed
+            sock.close()
+
+        self._start_server(socket_handler)
+        with HTTPSConnectionPool(self.host, self.port) as pool:
+            try:
+                pool.request("GET", "/", retries=0)
+            except MaxRetryError:  # We are violating the protocol
+                pass
+            successful = done_receiving.wait(LONG_TIMEOUT)
+            assert successful, "Timed out waiting for connection accept"
+            for protocol in util.ALPN_PROTOCOLS:
+                assert (
+                    protocol.encode("ascii") in self.buf
+                ), "missing ALPN protocol in SSL handshake"
 
 
 class TestClientCerts(SocketDummyServerTestCase):
@@ -936,6 +967,7 @@ class TestProxyManager(SocketDummyServerTestCase):
                     b"Host: google.com",
                     b"Accept-Encoding: identity",
                     b"Accept: */*",
+                    b"User-Agent: " + _get_default_user_agent().encode("utf-8"),
                     b"",
                     b"",
                 ]
@@ -1432,9 +1464,9 @@ class TestHeaders(SocketDummyServerTestCase):
             r = pool.request("GET", "/")
             assert HEADERS == dict(r.headers.items())  # to preserve case sensitivity
 
-    def test_headers_are_sent_with_the_original_case(self):
-        headers = {"foo": "bar", "bAz": "quux"}
-        parsed_headers = {}
+    def start_parsing_handler(self):
+        self.parsed_headers = OrderedDict()
+        self.received_headers = []
 
         def socket_handler(listener):
             sock = listener.accept()[0]
@@ -1443,11 +1475,13 @@ class TestHeaders(SocketDummyServerTestCase):
             while not buf.endswith(b"\r\n\r\n"):
                 buf += sock.recv(65536)
 
-            headers_list = [header for header in buf.split(b"\r\n")[1:] if header]
+            self.received_headers = [
+                header for header in buf.split(b"\r\n")[1:] if header
+            ]
 
-            for header in headers_list:
+            for header in self.received_headers:
                 (key, value) = header.split(b": ")
-                parsed_headers[key.decode("ascii")] = value.decode("ascii")
+                self.parsed_headers[key.decode("ascii")] = value.decode("ascii")
 
             sock.send(
                 ("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").encode("utf-8")
@@ -1456,6 +1490,26 @@ class TestHeaders(SocketDummyServerTestCase):
             sock.close()
 
         self._start_server(socket_handler)
+
+    def test_headers_are_sent_with_the_original_case(self):
+        headers = {"foo": "bar", "bAz": "quux"}
+
+        self.start_parsing_handler()
+        expected_headers = {
+            "Accept-Encoding": "identity",
+            "Host": "{0}:{1}".format(self.host, self.port),
+            "User-Agent": _get_default_user_agent(),
+        }
+        expected_headers.update(headers)
+
+        with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
+            pool.request("GET", "/", headers=HTTPHeaderDict(headers))
+            assert expected_headers == self.parsed_headers
+
+    def test_ua_header_can_be_overridden(self):
+        headers = {"uSeR-AgENt": "Definitely not urllib3!"}
+
+        self.start_parsing_handler()
         expected_headers = {
             "Accept-Encoding": "identity",
             "Host": "{0}:{1}".format(self.host, self.port),
@@ -1464,7 +1518,7 @@ class TestHeaders(SocketDummyServerTestCase):
 
         with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
             pool.request("GET", "/", headers=HTTPHeaderDict(headers))
-            assert expected_headers == parsed_headers
+            assert expected_headers == self.parsed_headers
 
     def test_request_headers_are_sent_in_the_original_order(self):
         # NOTE: Probability this test gives a false negative is 1/(K!)
@@ -1476,69 +1530,26 @@ class TestHeaders(SocketDummyServerTestCase):
             (u"X-Header-%d" % i, str(i)) for i in reversed(range(K))
         ]
 
-        actual_request_headers = []
+        def filter_non_x_headers(d):
+            return [(k, v) for (k, v) in d.items() if k.startswith("X-Header-")]
 
-        def socket_handler(listener):
-            sock = listener.accept()[0]
+        request_headers = OrderedDict()
 
-            buf = b""
-            while not buf.endswith(b"\r\n\r\n"):
-                buf += sock.recv(65536)
-
-            headers_list = [header for header in buf.split(b"\r\n")[1:] if header]
-
-            for header in headers_list:
-                (key, value) = header.split(b": ")
-                if not key.decode("ascii").startswith(u"X-Header-"):
-                    continue
-                actual_request_headers.append(
-                    (key.decode("ascii"), value.decode("ascii"))
-                )
-
-            sock.send(
-                (u"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").encode(
-                    "ascii"
-                )
-            )
-
-            sock.close()
-
-        self._start_server(socket_handler)
+        self.start_parsing_handler()
 
         with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
             pool.request("GET", "/", headers=OrderedDict(expected_request_headers))
-            assert expected_request_headers == actual_request_headers
+            request_headers = filter_non_x_headers(self.parsed_headers)
+            assert expected_request_headers == request_headers
 
     @resolvesLocalhostFQDN
     def test_request_host_header_ignores_fqdn_dot(self):
-
-        received_headers = []
-
-        def socket_handler(listener):
-            sock = listener.accept()[0]
-
-            buf = b""
-            while not buf.endswith(b"\r\n\r\n"):
-                buf += sock.recv(65536)
-
-            for header in buf.split(b"\r\n")[1:]:
-                if header:
-                    received_headers.append(header)
-
-            sock.send(
-                (u"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").encode(
-                    "ascii"
-                )
-            )
-
-            sock.close()
-
-        self._start_server(socket_handler)
+        self.start_parsing_handler()
 
         with HTTPConnectionPool(self.host + ".", self.port, retries=False) as pool:
             pool.request("GET", "/")
             self.assert_header_received(
-                received_headers, "Host", "%s:%s" % (self.host, self.port)
+                self.received_headers, "Host", "%s:%s" % (self.host, self.port)
             )
 
     def test_response_headers_are_returned_in_the_original_order(self):
@@ -1797,3 +1808,40 @@ class TestRetryPoolSizeDrainFail(SocketDummyServerTestCase):
         ) as pool:
             pool.urlopen("GET", "/not_found", preload_content=False)
             assert pool.num_connections == 1
+
+
+class TestMultipartResponse(SocketDummyServerTestCase):
+    def test_multipart_assert_header_parsing_no_defects(self):
+        def socket_handler(listener):
+            for _ in range(2):
+                sock = listener.accept()[0]
+                while not sock.recv(65536).endswith(b"\r\n\r\n"):
+                    pass
+
+                sock.sendall(
+                    b"HTTP/1.1 404 Not Found\r\n"
+                    b"Server: example.com\r\n"
+                    b"Content-Type: multipart/mixed; boundary=36eeb8c4e26d842a\r\n"
+                    b"Content-Length: 73\r\n"
+                    b"\r\n"
+                    b"--36eeb8c4e26d842a\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"\r\n"
+                    b"1\r\n"
+                    b"--36eeb8c4e26d842a--\r\n",
+                )
+                sock.close()
+
+        self._start_server(socket_handler)
+        from urllib3.connectionpool import log
+
+        with mock.patch.object(log, "warning") as log_warning:
+            with HTTPConnectionPool(self.host, self.port, timeout=3) as pool:
+                resp = pool.urlopen("GET", "/")
+                assert resp.status == 404
+                assert (
+                    resp.headers["content-type"]
+                    == "multipart/mixed; boundary=36eeb8c4e26d842a"
+                )
+                assert len(resp.data) == 73
+                log_warning.assert_not_called()

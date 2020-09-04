@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import contextlib
 import re
 import socket
+import ssl
 import zlib
 
 from io import BytesIO, BufferedReader, TextIOWrapper
@@ -16,6 +18,10 @@ from urllib3.exceptions import (
     ResponseNotChunked,
     ProtocolError,
     InvalidHeader,
+    httplib_IncompleteRead,
+    IncompleteRead,
+    InvalidChunkLength,
+    SSLError,
 )
 from urllib3.packages.six.moves import http_client as httplib
 from urllib3.util.retry import Retry, RequestHistory
@@ -758,9 +764,28 @@ class TestResponse(object):
         with pytest.raises(ResponseNotChunked):
             next(r)
 
-    def test_invalid_chunks(self):
+    def test_buggy_incomplete_read(self):
+        # Simulate buggy versions of Python (<2.7.4)
+        # See http://bugs.python.org/issue16298
+        content_length = 1337
+        fp = BytesIO(b"")
+        resp = HTTPResponse(
+            fp,
+            headers={"content-length": str(content_length)},
+            preload_content=False,
+            enforce_content_length=True,
+        )
+        with pytest.raises(ProtocolError) as ctx:
+            resp.read(3)
+
+        orig_ex = ctx.value.args[1]
+        assert isinstance(orig_ex, IncompleteRead)
+        assert orig_ex.partial == 0
+        assert orig_ex.expected == content_length
+
+    def test_incomplete_chunk(self):
         stream = [b"foooo", b"bbbbaaaaar"]
-        fp = MockChunkedInvalidEncoding(stream)
+        fp = MockChunkedIncompleteRead(stream)
         r = httplib.HTTPResponse(MockSock)
         r.fp = fp
         r.chunked = True
@@ -768,8 +793,28 @@ class TestResponse(object):
         resp = HTTPResponse(
             r, preload_content=False, headers={"transfer-encoding": "chunked"}
         )
-        with pytest.raises(ProtocolError):
+        with pytest.raises(ProtocolError) as ctx:
             next(resp.read_chunked())
+
+        orig_ex = ctx.value.args[1]
+        assert isinstance(orig_ex, httplib_IncompleteRead)
+
+    def test_invalid_chunk_length(self):
+        stream = [b"foooo", b"bbbbaaaaar"]
+        fp = MockChunkedInvalidChunkLength(stream)
+        r = httplib.HTTPResponse(MockSock)
+        r.fp = fp
+        r.chunked = True
+        r.chunk_left = None
+        resp = HTTPResponse(
+            r, preload_content=False, headers={"transfer-encoding": "chunked"}
+        )
+        with pytest.raises(ProtocolError) as ctx:
+            next(resp.read_chunked())
+
+        orig_ex = ctx.value.args[1]
+        assert isinstance(orig_ex, InvalidChunkLength)
+        assert orig_ex.length == six.b(fp.BAD_LENGTH_LINE)
 
     def test_chunked_response_without_crlf_on_end(self):
         stream = [b"foo", b"bar", b"baz"]
@@ -894,6 +939,30 @@ class TestResponse(object):
 
         assert b"foo\nbar" == data
 
+    def test_non_timeout_ssl_error_on_read(self):
+        mac_error = ssl.SSLError(
+            "SSL routines", "ssl3_get_record", "decryption failed or bad record mac"
+        )
+
+        @contextlib.contextmanager
+        def make_bad_mac_fp():
+            fp = BytesIO(b"")
+            with mock.patch.object(fp, "read") as fp_read:
+                # mac/decryption error
+                fp_read.side_effect = mac_error
+                yield fp
+
+        with make_bad_mac_fp() as fp:
+            with pytest.raises(SSLError) as e:
+                HTTPResponse(fp)
+            assert e.value.args[0] == mac_error
+
+        with make_bad_mac_fp() as fp:
+            resp = HTTPResponse(fp, preload_content=False)
+            with pytest.raises(SSLError) as e:
+                resp.read()
+            assert e.value.args[0] == mac_error
+
 
 class MockChunkedEncodingResponse(object):
     def __init__(self, content):
@@ -971,9 +1040,16 @@ class MockChunkedEncodingResponse(object):
         self.closed = True
 
 
-class MockChunkedInvalidEncoding(MockChunkedEncodingResponse):
+class MockChunkedIncompleteRead(MockChunkedEncodingResponse):
     def _encode_chunk(self, chunk):
-        return "ZZZ\r\n%s\r\n" % chunk.decode()
+        return "9999\r\n%s\r\n" % chunk.decode()
+
+
+class MockChunkedInvalidChunkLength(MockChunkedEncodingResponse):
+    BAD_LENGTH_LINE = "ZZZ\r\n"
+
+    def _encode_chunk(self, chunk):
+        return "%s%s\r\n" % (self.BAD_LENGTH_LINE, chunk.decode())
 
 
 class MockChunkedEncodingWithoutCRLFOnEnd(MockChunkedEncodingResponse):
